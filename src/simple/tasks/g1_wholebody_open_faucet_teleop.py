@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 from gymnasium import spaces
 import random
+import re
 
 from simple.assets import AssetManager
 from simple.core.actor import Actor, ActorReigstry, ObjectActor
@@ -34,6 +35,13 @@ from simple.tasks.registry import TaskRegistry
 _LIFT_HEIGHT = 0.1
 _PLACE_HEIGHT = 0.5
 _LOWER_HEIGHT = 0.1
+
+# The faucet is open once a hand has turned its handle (articulate_joint_0) past _OPEN_ANGLE the way the teleop
+# demos turn it. Turning it the other way, or with an arm or the body, never counts.
+_OPEN_ANGLE = 0.7  # rad
+_OPEN_SIGN = 1.0  # the demos turn the handle to positive angles
+_TURNING = 2e-3  # rad the handle moves the opening way between two checks for it to count as being turned
+_HAND_BODY = re.compile(r"(left|right)_(wrist_yaw_link|hand_\w+)")  # palm and fingers
 
 
 @TaskRegistry.register("g1_wholebody_open_faucet_teleop")
@@ -158,6 +166,7 @@ class G1WholebodyOpenFaucetTaskTeleop(Task):
         self._layout = None
         self._init_target_height = None
         self._contact_started = False
+        self._handle = self._new_handle_track()
 
         self.robot_cfg.update(
             dict(
@@ -248,9 +257,12 @@ class G1WholebodyOpenFaucetTaskTeleop(Task):
         lang_dr = self.dr.get_randomizer("language")
         assert lang_dr is not None
         language_template = lang_dr(split)
-        self._instruction = language_template.format(self._target.asset.name)  # type: ignore
+        # the faucet is the task object; the graspnet "target" is table clutter and may be absent
+        target_name = self._target.asset.name if self._target is not None else ""  # type: ignore
+        self._instruction = language_template.format(target_name)
         self._init_target_height = None
         self.reward = 0
+        self._handle = self._new_handle_track()
         self.robot.reset(spawn_pose=self.layout.robot.pose)
 
     def state_dict(self) -> Dict[str, Any]:
@@ -262,15 +274,47 @@ class G1WholebodyOpenFaucetTaskTeleop(Task):
         reward = self.compute_reward(info, *args, **kwargs)
         return reward >= self.metadata["success_criteria"]
     
+    @staticmethod
+    def _new_handle_track() -> dict[str, Any]:
+        return dict(q_prev=None, by_hand=False, by_arm_or_body=set(), open_angle=0.0, wrong_way_angle=0.0)
+
+    @property
+    def handle_check(self) -> dict[str, Any]:
+        """How the faucet handle has been turned this episode: the farthest it got the opening way and the other
+        way (rad), and which robot links touched it while it turned the opening way."""
+        track = self._handle
+        return dict(open_angle=track["open_angle"], wrong_way_angle=track["wrong_way_angle"],
+                    turned_by_hand=track["by_hand"], turned_by_arm_or_body=sorted(track["by_arm_or_body"]))
+
     def check_wether_faucet_is_opened(self, info: dict[str, Any], *args, **kwargs) -> bool:
         mujoco_env = kwargs.get("mujoco_env",None)
         if mujoco_env is  None:
             return False
-        
-        faucet_joint0_qpos = mujoco_env.mjData.joint("articulate_joint_0").qpos[0]
-        # faucet_joint1_qpos = mujoco_env.mjData.joint("articulate_joint_1").qpos[0]
-        return faucet_joint0_qpos > 0.7 or faucet_joint0_qpos <-0.7  
-        
+
+        m, d = mujoco_env.mjModel, mujoco_env.mjData
+        joint = m.joint("articulate_joint_0")
+        q = float(d.qpos[joint.qposadr[0]])
+        track = self._handle
+        if track["q_prev"] is not None and _OPEN_SIGN * (q - track["q_prev"]) > _TURNING:
+            # the handle is turning the opening way: note which robot links touch it
+            handle, robot = m.jnt_bodyid[joint.id], m.body("pelvis").id
+            for contact in d.contact[: d.ncon]:
+                bodies = m.geom_bodyid[contact.geom1], m.geom_bodyid[contact.geom2]
+                if handle not in bodies:
+                    continue
+                other = bodies[1] if bodies[0] == handle else bodies[0]
+                if m.body_rootid[other] != robot:
+                    continue
+                name = m.body(other).name
+                if _HAND_BODY.fullmatch(name):
+                    track["by_hand"] = True
+                else:
+                    track["by_arm_or_body"].add(name)
+        track["q_prev"] = q
+        track["open_angle"] = max(track["open_angle"], _OPEN_SIGN * q)
+        track["wrong_way_angle"] = max(track["wrong_way_angle"], -_OPEN_SIGN * q)
+        return _OPEN_SIGN * q > _OPEN_ANGLE and track["by_hand"] and not track["by_arm_or_body"]
+
 
     def compute_reward(self, info: dict[str, Any], *args, **kwargs) -> float:
         faucet_is_opened = self.check_wether_faucet_is_opened(info, *args, **kwargs)

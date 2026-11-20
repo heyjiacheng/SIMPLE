@@ -125,6 +125,12 @@ Output is written to `<save-dir>/<env-id>/dr-level-<dr-level>/`, for example
 Repeat the command with each required
 `--dr-level` to build multiple evaluation splits.
 
+`--spatial-level 1` places the task's objects anew for every episode, spread further to either side, as
+`teleop_decoupled_wbc --spatial-level 1` does (5 cm more each way, or the task's own wider rule), at any
+`--dr-level`. Each episode keeps the robot position of its source episode. The output goes to
+`<save-dir>/<env-id>/dr-level-<dr-level>-spatial-1/`, next to the set built without it. The evaluation then loads
+these layouts as they are.
+
 
 
 On replay, `DRManager.load_state_dict(state_dict, dr_level)` controls how much of

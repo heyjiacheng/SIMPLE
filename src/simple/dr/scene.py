@@ -23,6 +23,20 @@ import numpy as np
 import transforms3d as t3d
 from dataclasses import dataclass
 
+
+def _load_table(table_cfg: dict) -> Asset:
+    """Table from its recorded config. The uid selects the shape: "box", "cylinder"
+    (round) or "prism" (polygonal footprint, given by its "vertices")."""
+    shape = {"vertices": table_cfg["vertices"]} if "vertices" in table_cfg else {}
+    return AssetManager.create(
+        f"primitive:{table_cfg.get('uid', 'box')}",
+        size=table_cfg["size"],
+        position=table_cfg["pose"]["position"],
+        quaternion=table_cfg["pose"]["quaternion"],
+        **shape,
+    )
+
+
 class SceneDR(Randomizer):
     
     def __init__(self, cfg:"TabletopSceneDRCfg") -> None:
@@ -48,23 +62,10 @@ class TabletopSceneDR(SceneDR):
         self._inner_state.center_offset = state_dict["center_offset"]
         self._inner_state.center_orientation = state_dict["center_orientation"]
         
-        table = AssetManager.create(
-            "primitive:box",
-            size=table_cfg["size"],
-            position=table_cfg["pose"]["position"],
-            quaternion=table_cfg["pose"]["quaternion"]
-        )
-        self._inner_state.table = table
-        
+        self._inner_state.table = _load_table(table_cfg)
+
         if "table2" in state_dict and state_dict["table2"] is not None:
-            table2_cfg = state_dict["table2"]
-            table2 = AssetManager.create(
-                "primitive:box",
-                size=table2_cfg["size"],
-                position=table2_cfg["pose"]["position"],
-                quaternion=table2_cfg["pose"]["quaternion"]
-            )
-            self._inner_state.table2 = table2
+            self._inner_state.table2 = _load_table(state_dict["table2"])
         
 
     def __call__(self, split: str, *args, **kwargs) -> TabletopScene:

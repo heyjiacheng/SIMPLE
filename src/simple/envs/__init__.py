@@ -186,6 +186,16 @@ register(
     entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
     kwargs={"task":"g1_wholebody_bend_pick_teleop"},
 )
+register(
+    id="simple/G1WholebodyUncapBottleTeleop-v0",
+    entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
+    kwargs={"task":"g1_wholebody_uncap_bottle_teleop"},
+)
+register(
+    id="simple/G1WholebodyUncapSmallBottleTeleop-v0",
+    entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
+    kwargs={"task":"g1_wholebody_uncap_small_bottle_teleop"},
+)
 # def task_register(task):
 #     register(
 #         id="FrankaTabletopGrasp-v0",

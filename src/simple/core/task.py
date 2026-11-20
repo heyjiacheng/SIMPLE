@@ -111,6 +111,41 @@ class Task(ABC):
     def action_space(self) -> spaces.Space:
         ...
 
+    # --spatial-level: 0 is the task's own object placement, 1 spreads the objects further to either side.
+    SPATIAL_LEVELS = (0, 1)
+
+    def set_spatial_level(self, level: int) -> None:
+        """How far to either side the task's objects (target, articulated object, container) may stand.
+        0: the task's own regions. 1: wider, by `widened_spatial_cfg`. The robot, the table and the clutter stay as
+        they are. It takes effect at the next reset. Recorded episodes keep their layout, so a replay doesn't need it.
+        """
+        from copy import copy, deepcopy
+
+        if level not in self.SPATIAL_LEVELS:
+            raise ValueError(f"spatial level {level}: expected one of {self.SPATIAL_LEVELS}")
+        if "_spatial_level0" not in self.__dict__:
+            self._spatial_level0 = self.dr.get_randomizer("spatial")
+        base = self._spatial_level0
+        if base is None:
+            raise ValueError(f"{self.uid} has no spatial randomizer to widen")
+        if level == 0:
+            randomizer = base
+        else:
+            # a shallow copy: after a reset the randomizer holds a collision checker that can't be deep-copied (it
+            # builds a new one at every placement anyway)
+            randomizer = copy(base)
+            randomizer.cfg = self.widened_spatial_cfg(deepcopy(base.cfg))
+            randomizer._inner_state = None
+        self.dr.randomizers["spatial"] = randomizer
+        self.spatial_level = level
+
+    def widened_spatial_cfg(self, cfg: RandomizerCfg) -> RandomizerCfg:
+        """The spatial config of spatial level 1: the object regions `WIDE_SIDE_MARGIN` (5 cm) wider on each side.
+        A task whose objects need another rule overrides this."""
+        from simple.dr.spatial import wide_spatial_cfg
+
+        return wide_spatial_cfg(cfg)  # type: ignore[arg-type]
+
     def save_config(self) -> dict[str, Any]:
         info = {
             "uid": self.uid,
@@ -180,7 +215,8 @@ class Task(ABC):
         target_dr = self.dr.get_randomizer("target")
         if target_dr is not None:
             target_asset = target_dr(split)
-            self._layout.add_object("target", target_asset)
+            if target_asset is not None:  # None: scene recorded without a target
+                self._layout.add_object("target", target_asset)
 
         # distractor randomization
         distractors_dr = self.dr.get_randomizer("distractors")

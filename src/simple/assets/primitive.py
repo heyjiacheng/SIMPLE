@@ -29,6 +29,61 @@ class Box(Primitive):
         return f"Box(size={self.size}, position={self.pose.position}, quaternion={self.pose.quaternion})"
 
 
+class Cylinder(Primitive):
+    """A static round table top: a z-axis cylinder.
+
+    ``size`` follows the :class:`Box` convention -- the full bounding-box
+    extent ``[2 * radius, 2 * radius, height]`` -- so code that reads the
+    table thickness from ``size[2]`` works for either shape.
+    """
+
+    def __init__(self, size, position, quaternion) -> None:
+        self.uid = "cylinder"
+        if not np.isclose(size[0], size[1]):
+            raise ValueError(f"Cylinder needs equal x/y extents, got size={size}")
+
+        self.size = size
+        self.pose = Pose(position, quaternion)
+
+    @property
+    def radius(self) -> float:
+        return 0.5 * float(self.size[0])
+
+    def set_material(self, material: dict) -> None:
+        self.material = material
+
+    def __repr__(self) -> str:
+        return f"Cylinder(radius={self.radius}, height={self.size[2]}, position={self.pose.position}, quaternion={self.pose.quaternion})"
+
+
+class Prism(Primitive):
+    """A static table top with a convex polygonal footprint: a z-axis prism.
+
+    ``vertices`` are the footprint corners ``[x, y]`` in the table frame,
+    counterclockwise. ``size`` follows the :class:`Box` convention -- the full
+    bounding-box extent ``[x, y, height]`` -- and the pose is the frame of that
+    bounding box, so code that reads the table thickness from ``size[2]`` works
+    for any shape.
+    """
+
+    def __init__(self, size, position, quaternion, vertices) -> None:
+        self.uid = "prism"
+        self.vertices = [[float(x), float(y)] for x, y in vertices]
+        edges = np.diff(np.asarray(self.vertices + self.vertices[:2]), axis=0)
+        turns = edges[:-1, 0] * edges[1:, 1] - edges[:-1, 1] * edges[1:, 0]
+        if len(self.vertices) < 3 or np.any(turns <= 0):
+            raise ValueError(f"Prism needs a convex counterclockwise footprint, got {self.vertices}")
+
+        self.size = size
+        self.pose = Pose(position, quaternion)
+
+    def set_material(self, material: dict) -> None:
+        self.material = material
+
+    def __repr__(self) -> str:
+        return f"Prism(vertices={self.vertices}, height={self.size[2]}, position={self.pose.position}, quaternion={self.pose.quaternion})"
+
+
 class Cube(Primitive):
     """A movable box primitive usable as a pickable target object.
 
@@ -96,6 +151,10 @@ class PrimitiveAsseManager(AssetManager):
     def load(self, asset_id: str, *args, **kwargs) -> Asset:
         if asset_id == "box":
             return Box(*args, **kwargs)
+        elif asset_id == "cylinder":
+            return Cylinder(*args, **kwargs)
+        elif asset_id == "prism":
+            return Prism(*args, **kwargs)
         elif asset_id == "cube":
             return Cube(*args, **kwargs)
         else:

@@ -52,13 +52,19 @@ class StreamingThread:
         fps:          Target publish rate (used for get() timeout only).
         publishers:   Objects with a ``publish_raw_frame(frame)`` method.
         on_ended:     Optional callback invoked when the loop exits.
+        keepalive:    While no new frame arrives (episode save, env reset), re-send the
+                      last frame every this many seconds. The headset's video stays frozen
+                      for good after a gap of a few seconds, so the stream must not go
+                      silent. 0 disables it.
     """
 
-    def __init__(self, frame_buffer: FrameBuffer, fps: int, publishers, on_ended=None):
+    def __init__(self, frame_buffer: FrameBuffer, fps: int, publishers, on_ended=None,
+                 keepalive: float = 0.1):
         self._frame_buffer = frame_buffer
         self._fps = fps
         self._publishers = publishers
         self._on_ended = on_ended
+        self._keepalive = keepalive
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -87,14 +93,19 @@ class StreamingThread:
         frame_timeout = 1.0 / self._fps
         print(f"[Streaming] Loop at {self._fps} FPS")
 
+        last_frame, last_sent = None, 0.0
         try:
             while not self._stop_event.is_set():
                 frame = self._frame_buffer.get(timeout=frame_timeout)
                 if frame is None:
-                    continue
+                    if (last_frame is None or self._keepalive <= 0
+                            or time.monotonic() - last_sent < self._keepalive):
+                        continue
+                    frame = last_frame  # the sim is busy: repeat the last frame
 
                 for pub in self._publishers:
                     pub.publish_raw_frame(frame)
+                last_frame, last_sent = frame, time.monotonic()
         finally:
             for pub in self._publishers:
                 pub.close()

@@ -16,6 +16,7 @@ from tqdm import tqdm
 import glob
 
 from simple.robots.g1_sonic import WHOLE_BODY_JOINTS
+from simple.cli._decoupled_wbc_recording import load_failed_episodes, write_failed_episodes
 
 # see WHOLE_BODY_JOINTS in g1_sonic.py 
 STATE_SLICES = [
@@ -281,6 +282,9 @@ def main():
     all_index = []
     all_task_index = []
     all_done = []
+    # episodes teleop --keep-failures saved as failed ({new episode index: reason}), carried over from each sim root's
+    # meta/failed_episodes.json; scripts/merge_psi0_datasets.py --drop-failed leaves them out of a training set
+    failed_episodes = {}
 
     out_dir = Path(args.out_dir).resolve()
     (out_dir / "data").mkdir(parents=True, exist_ok=True)
@@ -301,6 +305,7 @@ def main():
         sim_info = json.loads((sim_root / "meta" / "info.json").read_text())
         sim_tasks = load_jsonl(sim_root / "meta" / "tasks.jsonl")
         episodes_info = load_jsonl(sim_root / "meta" / "episodes.jsonl")
+        sim_failed = load_failed_episodes(sim_root)
 
         original_fps = float(sim_info["fps"])
         if args.fps / original_fps != args.downsample:
@@ -450,6 +455,8 @@ def main():
             all_index.append(index)
             all_task_index.append(task_index)
             all_done.append(done.astype(np.float32))
+            if ep_index in sim_failed:
+                failed_episodes[episode_idx] = sim_failed[ep_index]
 
             last_index += n
             episode_idx += 1
@@ -543,6 +550,11 @@ def main():
     print("Wrote lang_map.json")
     (meta_dir / "modality.json").write_text(json.dumps(modality_dict(), indent=2))
     print("Wrote modality.json")
+    # (no failed episodes: no file, and none left from an earlier run into the same --out-dir)
+    write_failed_episodes(out_dir, failed_episodes)
+    if failed_episodes:
+        print(f"Wrote failed_episodes.json: {len(failed_episodes)} of the {len(episodes)} episodes failed at teleop; "
+              f"scripts/merge_psi0_datasets.py --drop-failed makes a training set without them")
 
 
 if __name__ == "__main__":

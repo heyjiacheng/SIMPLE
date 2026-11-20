@@ -34,6 +34,7 @@ import simple
 import simple.scenes
 # from simple.core import sensors
 import simple.sensors
+from simple.assets.primitive import Cylinder, Prism
 from simple.core.actor import ObjectActor, VisualFrame, VisualGrasp, ArticulatedObjectActor
 from simple.core.robot import Robot
 from simple.core.simulator import Simulator
@@ -76,6 +77,41 @@ def euler_angles_to_quats(euler_angles: np.ndarray, degrees: bool = False, extri
     else:
         result = result[:, [3, 0, 1, 2]]
     return result
+
+def define_prism_mesh(stage, prim_path: str, prism: Prism) -> None:
+    """Author a prism table top as a unit-sized mesh like the built-in ones (footprint
+    divided by its bounding box, height 1, z-up), with flat normals, planar UVs on the
+    caps and the translate/orient/scale ops that CreateMeshPrimWithDefaultXform adds."""
+    xy = np.asarray(prism.vertices, dtype=np.float64) / np.asarray(prism.size[:2], dtype=np.float64)
+    n = len(xy)
+    edge = np.roll(xy, -1, axis=0) - xy
+    outward = np.stack([edge[:, 1], -edge[:, 0], np.zeros(n)], 1)
+    outward /= np.linalg.norm(outward, axis=1, keepdims=True)
+    # bottom ring 0..n-1, top ring n..2n-1; caps and sides wound counterclockwise seen from outside
+    faces = [list(range(n, 2 * n)), list(range(n - 1, -1, -1))]
+    faces += [[i, (i + 1) % n, n + (i + 1) % n, n + i] for i in range(n)]
+    normals = [(0.0, 0.0, 1.0)] * n + [(0.0, 0.0, -1.0)] * n + [tuple(v) for v in outward for _ in range(4)]
+    run = np.concatenate([[0.0], np.cumsum(np.linalg.norm(edge, axis=1))])
+    run /= run[-1]
+    st = [tuple(xy[i] + 0.5) for i in range(n)] + [tuple(xy[i] + 0.5) for i in range(n - 1, -1, -1)]
+    for i in range(n):
+        st += [(run[i], 0.0), (run[i + 1], 0.0), (run[i + 1], 1.0), (run[i], 1.0)]
+
+    mesh = UsdGeom.Mesh.Define(stage, prim_path)
+    mesh.CreatePointsAttr([Gf.Vec3f(float(x), float(y), z) for z in (-0.5, 0.5) for x, y in xy])
+    mesh.CreateFaceVertexCountsAttr([len(f) for f in faces])
+    mesh.CreateFaceVertexIndicesAttr([i for f in faces for i in f])
+    mesh.CreateNormalsAttr([Gf.Vec3f(*map(float, v)) for v in normals])
+    mesh.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
+    mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+    (x0, y0), (x1, y1) = xy.min(0), xy.max(0)
+    mesh.CreateExtentAttr([Gf.Vec3f(float(x0), float(y0), -0.5), Gf.Vec3f(float(x1), float(y1), 0.5)])
+    UsdGeom.PrimvarsAPI(mesh).CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.faceVarying).Set(
+        [Gf.Vec2f(float(u), float(v)) for u, v in st])
+    xformable = UsdGeom.Xformable(mesh)
+    xformable.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble)
+    xformable.AddOrientOp(UsdGeom.XformOp.PrecisionDouble)
+    xformable.AddScaleOp(UsdGeom.XformOp.PrecisionDouble)
 
 def compute_obb(bbox_cache: UsdGeom.BBoxCache, prim_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Computes the Oriented Bounding Box (OBB) of a prim
@@ -1099,7 +1135,16 @@ class IsaacSimSimulator(Simulator):
         if stage.GetPrimAtPath(prim_path).IsValid():
             stage.RemovePrim(prim_path)
 
-        omni.kit.commands.execute("CreateMeshPrimWithDefaultXform", prim_type="Cube", prim_path=prim_path)
+        # All table meshes are unit-sized (cube edge 1, cylinder radius 0.5, prism
+        # footprint within its unit bounding box; height 1, z-up), so scaling by
+        # `size` gives the table's extent for every shape.
+        if isinstance(table_box, Prism):
+            define_prism_mesh(stage, prim_path, table_box)
+        elif isinstance(table_box, Cylinder):
+            # 128 sides keeps a ~1.6 m round top visibly round (default is 32)
+            omni.kit.commands.execute("CreateMeshPrimWithDefaultXform", prim_type="Cylinder", prim_path=prim_path, u_patches=128)
+        else:
+            omni.kit.commands.execute("CreateMeshPrimWithDefaultXform", prim_type="Cube", prim_path=prim_path)
         prim = stage.GetPrimAtPath(prim_path)
 
         p, q, s = table_box.pose.position, table_box.pose.quaternion, table_box.size

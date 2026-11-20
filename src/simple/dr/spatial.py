@@ -321,3 +321,30 @@ class SpatialDRCfg(RandomizerCfg):
     # container_rotate_z: Box = Box(low=0.0, high=0.0)
     obj_surface_map: dict[str, str | list[str]] | None = None
     randmizer_class: Type[Randomizer] = SpatialDR
+
+
+# Spatial level 1 (`Task.set_spatial_level`, the CLIs' --spatial-level): the task's objects stand up to this much
+# further to either side (left-right, world y) than the task's own regions allow.
+WIDE_SIDE_MARGIN = 0.05
+_OBJECT_REGIONS = ("target_region", "articulated_region", "container_region")  # the robot and the clutter stay
+
+
+def widen_sideways(box: Box, margin: float) -> Box:
+    """`box` (x, y[, z]) with its y range `margin` wider on each side."""
+    low, high = [float(v) for v in box.low], [float(v) for v in box.high]
+    centre, half = 0.5 * (low[1] + high[1]), 0.5 * abs(high[1] - low[1]) + margin
+    low[1], high[1] = round(centre - half, 6), round(centre + half, 6)
+    return Box(low=low, high=high)
+
+
+def wide_spatial_cfg(cfg: SpatialDRCfg, margin: float = WIDE_SIDE_MARGIN) -> SpatialDRCfg:
+    """A copy of `cfg` whose object regions (target, articulated object, container) are `margin` wider on each
+    side. The robot region, the clutter region and everything else stay as they are."""
+    from copy import deepcopy
+
+    cfg = deepcopy(cfg)
+    for name in _OBJECT_REGIONS:
+        box = getattr(cfg, name, None)
+        if isinstance(box, Box) and np.ndim(box.low) == 1 and len(box.low) >= 2:
+            setattr(cfg, name, widen_sideways(box, margin))
+    return cfg

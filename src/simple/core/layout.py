@@ -136,7 +136,6 @@ class Layout:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the layout to a dictionary representation."""
-        test = self.actors["target"].to_dict()  # CHECK
         layout_dict = {
             "actors": {name: actor.to_dict() for name, actor in self.actors.items() if name != "robot"}, # CHECK 
             "lights": [light.to_dict() for light in self.lights],

@@ -1,0 +1,12 @@
+{
+  "scene1": {"tables": ["rect", "big", "small"], "y_limit": 1.1},
+  "scene2": {"tables": ["rect", "big", "small"], "y_limit": 1.1},
+  "scene3": {"tables": ["rect", "big", "small"], "y_limit": 1.1},
+  "scene9": {"tables": ["rect", "big", "small"], "y_limit": 1.1},
+  "scene25": {"tables": ["rect", "big", "small"], "y_limit": 1.1},
+  "scene6": {"tables": ["rect", "small"], "y_limit": 0.55},
+  "scene7": {"tables": ["rect", "small"], "y_limit": 0.55},
+  "scene12": {"tables": ["rect", "small"], "y_limit": 0.55},
+  "scene14": {"tables": ["rect", "small"], "y_limit": 0.55},
+  "scene15": {"tables": ["rect", "small"], "y_limit": 0.55}
+}

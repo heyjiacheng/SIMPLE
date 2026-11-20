@@ -1,0 +1,8 @@
+{
+  "scene10": {"tables": ["triangle", "small_triangle"], "y_limit": 1.1},
+  "scene13": {"tables": ["triangle", "small_triangle"], "y_limit": 1.1},
+  "scene17": {"tables": ["triangle", "small_triangle"], "y_limit": 1.1},
+  "scene23": {"tables": ["triangle", "small_triangle"], "y_limit": 1.1},
+  "scene28": {"tables": ["triangle", "small_triangle"], "y_limit": 1.1},
+  "scene42": {"tables": ["triangle", "small_triangle"], "y_limit": 1.1}
+}

@@ -37,6 +37,11 @@ if TYPE_CHECKING:
 
 from simple.cli.render_decoupled_wbc import _load_episodes, _load_episode_configs
 from simple.cli._decoupled_wbc_recording import (
+    FAILED_EPISODES_FILE,
+    TELEOP_EPISODE_KEYS,
+    load_failed_episodes,
+    mark_failed_episode,
+    prune_failed_episodes,
     set_ego_view_feature_shape,
     validate_existing_ego_view_feature_shape,
 )
@@ -88,17 +93,28 @@ def _init_exporter(
     return exporter
 
 
-def _save_episode_env_config(exporter, env_conf: dict, episode_index: int):
-    """Write the episode's environment_config into episodes.jsonl."""
+def _save_episode_env_config(exporter, env_conf: dict, episode_index: int, teleop_info: dict | None = None):
+    """Write the episode's environment_config, and the source episode's teleop settings if known, into episodes.jsonl."""
     meta_file = exporter.root / "meta" / "episodes.jsonl"
     if not meta_file.exists():
         return
     with open(meta_file, "r") as f:
         lines = [json.loads(line) for line in f]
     lines[episode_index]["environment_config"] = json.dumps(env_conf, cls=NumpyArrayEncoder)
+    lines[episode_index].update(teleop_info or {})
     with open(meta_file, "w") as f:
         for entry in lines:
             f.write(json.dumps(entry) + "\n")
+
+
+def _load_episode_teleop_info(data_dir: str) -> dict[int, dict]:
+    """The teleop settings of each source episode (teleop_decoupled_wbc --hand-mode, --vr-view, ...), where recorded."""
+    meta_file = Path(data_dir) / "meta" / "episodes.jsonl"
+    if not meta_file.exists():
+        return {}
+    with open(meta_file, "r") as f:
+        entries = [json.loads(line) for line in f if line.strip()]
+    return {int(e["episode_index"]): {k: e[k] for k in TELEOP_EPISODE_KEYS if k in e} for e in entries}
 
 
 def _validate_and_repair_dataset(save_dir: str, data_dir: str):
@@ -166,13 +182,15 @@ def _validate_and_repair_dataset(save_dir: str, data_dir: str):
     return len(valid_episodes), len(removed_indices), removed_indices
 
 
-def _build_frame(observation, source_row, registered_features: set = None):
+def _build_frame(observation, source_row, registered_features: set = None, object_poses=None):
     """Assemble one recording frame by reusing source dataset fields with newly rendered image.
 
     Args:
         observation: Current observation with newly rendered head_stereo_left image
         source_row: Source dataset row with all other fields
         registered_features: Set of valid feature names (if None, copy all except metadata)
+        object_poses: Object poses from the replay sim; replaces the recorded ones,
+            which no longer match when the episode config moved the objects
 
     Returns:
         Frame dict with source data + new image
@@ -201,6 +219,8 @@ def _build_frame(observation, source_row, registered_features: set = None):
 
     # Replace with newly rendered image
     frame["observation.images.ego_view"] = observation["head_stereo_left"]
+    if object_poses is not None:
+        frame["observation.object_poses"] = object_poses
 
     return frame
 
@@ -250,10 +270,21 @@ def main(
 
     # Load per-episode environment configs
     episode_configs = _load_episode_configs(data_dir)
+    episode_teleop_info = _load_episode_teleop_info(data_dir)
     if episode_configs:
         print(f"Loaded environment configs for {len(episode_configs)} episodes")
     else:
         print("WARNING: No environment_config found in episodes.jsonl")
+    # Episodes teleop --keep-failures saved as failed: replayed and kept whatever the success check says, and marked
+    # failed in the output too. They don't count in the success rate.
+    src_failed = load_failed_episodes(data_dir)
+    if src_failed:
+        print(f"{len(src_failed)} episodes are marked failed ({FAILED_EPISODES_FILE}): kept, and marked, whether or "
+              f"not their replay succeeds")
+
+    def _src_episode(i: int):
+        """The source episode run `i` (the episode loop's index) replays."""
+        return episode_ids[i % total_episodes] if loop_episodes else i
 
     # Create environment
     config = tyro.cli(SimLoopConfig, config=(tyro.conf.ConsolidateSubcommandArgs,), args=[])
@@ -408,6 +439,9 @@ def main(
                     robot.joint_names,
                     observation["head_stereo_left"].shape,
                 )
+                # a resumed dataset keeps its recorded object layout, whatever this episode holds
+                pose_names = exporter.features.get("observation.object_poses", {}).get("names", [])
+                obj_names = [name.rsplit(".", 1)[0] for name in pose_names[::7]]
                 print(f"[Record] Exporter initialized, saving to {run_save_dir}")
                 print(f"[Record] Ego view shape: {observation['head_stereo_left'].shape}")
                 print(f"[Record] Recording {len(obj_names)} objects: {obj_names}")
@@ -422,6 +456,10 @@ def main(
                             print(f"[WARNING] Episode count mismatch: loaded {episodes_saved} but found {saved_count} in episodes.jsonl")
                             episodes_saved = saved_count
                     print(f"[Record] Resuming from episode {episodes_saved}")
+                # A failed episode is marked before it is saved: drop a mark whose save died (the next episode takes
+                # its index). Only a dataset with failed episodes has marks.
+                if stale := prune_failed_episodes(run_save_dir, episodes_saved):
+                    print(f"[Record] Dropped the failure marks of episodes {stale}: they were never saved")
 
             agent.load_episode(ep_data)
             # TODO engage RL policy immediately
@@ -554,12 +592,13 @@ def main(
                 video_dir = Path(data_dir) / "videos" / "chunk-000" / "observation.images.ego_view"
                 video_path = video_dir / f"episode_{ep_idx:06d}.mp4"
 
-                cap = cv2.VideoCapture(str(video_path))
-                _, frame = cap.read()
-                cap.release()
+                if video_path.exists():  # raw teleop releases ship without videos
+                    cap = cv2.VideoCapture(str(video_path))
+                    _, frame = cap.read()
+                    cap.release()
 
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                # Image.fromarray(frame_rgb).save(f"{ep_idx}_loaded.png")
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    # Image.fromarray(frame_rgb).save(f"{ep_idx}_loaded.png")
 
             agent._wbc_policy.lower_body_policy.gait_indices = torch.zeros((1), dtype=torch.float32)
             agent._data_row_index = 0  # Start from beginning of episode data (now synchronized)
@@ -636,7 +675,15 @@ def main(
                     if exporter is not None and 0 <= agent._data_row_index < len(ep_data):
                         source_row = ep_data.iloc[agent._data_row_index]
                         registered_features = set(exporter.features.keys())
-                        frame = _build_frame(observation_before_step, source_row, registered_features)
+                        object_poses = None
+                        if "observation.object_poses" in registered_features:
+                            # same layout as teleop recording: (pos, quat wxyz) per object;
+                            # objects this episode's scene lacks (e.g. removed with its
+                            # table) are zeros, keeping the feature shape of the dataset
+                            object_poses = np.concatenate(
+                                [privileged_info.get(name, np.zeros(7)) for name in obj_names]
+                            ).astype(np.float64)
+                        frame = _build_frame(observation_before_step, source_row, registered_features, object_poses)
                         exporter.add_frame(frame)
 
                     if terminated or truncated:
@@ -655,13 +702,18 @@ def main(
             finally:
                 step_pbar.close()
 
-            # Save episode only if successful
+            # Save episode only if successful, or failed at teleop (kept as failed, whatever its replay did)
             success = getattr(sonic_env, "_success", False)
-            if exporter is not None and success:
+            failed_reason = src_failed.get(src_ep_id)
+            if exporter is not None and (success or failed_reason is not None):
+                if failed_reason is not None:
+                    mark_failed_episode(exporter.root, episodes_saved, failed_reason)  # before the save, see there
                 exporter.save_episode()
-                _save_episode_env_config(exporter, saved_env_conf, episodes_saved)
+                _save_episode_env_config(exporter, saved_env_conf, episodes_saved,
+                                         episode_teleop_info.get(src_ep_id))
                 episodes_saved += 1
-                print(f"[Record] Episode {episodes_saved} saved")
+                print(f"[Record] Episode {episodes_saved} saved"
+                      + (f", marked failed ({failed_reason}) as at teleop" if failed_reason is not None else ""))
             elif exporter is not None and not success:
                 exporter.skip_and_start_new_episode()
                 # Clean up failed episode's MP4 file
@@ -712,18 +764,24 @@ def main(
             with open(replay_txt, "a") as f:
                 f.write(f"{ep_idx}: {success}\n")
 
-            completed = len(results)
-            sr = sum(results.values()) / completed
-            successes = sum(results.values())
+            scored = {i: s for i, s in results.items() if _src_episode(i) not in src_failed}
+            completed = len(scored)
+            successes = sum(scored.values())
+            sr = successes / completed if completed else 0.0
             pbar.set_postfix(SR=f"{sr:.1%} ({successes}/{completed})")
             status = "✓" if success else "✗"
+            if failed_reason is not None:
+                status += f" failed at teleop ({failed_reason}), kept, not in SR"
             tqdm.write(f"  ep {ep_idx:>3}  {status}  SR={sr:.1%} ({successes}/{completed})")
 
         # Report statistics
         if results:
-            sr = sum(results.values()) / len(results)
+            scored = {i: s for i, s in results.items() if _src_episode(i) not in src_failed}
+            sr = sum(scored.values()) / len(scored) if scored else 0.0
             print(f"\n{'='*50}")
-            print(f"Success rate: {sr:.1%} ({sum(results.values())}/{len(results)})")
+            print(f"Success rate: {sr:.1%} ({sum(scored.values())}/{len(scored)})"
+                  + (f", without the {len(results) - len(scored)} episodes marked failed at teleop"
+                     if len(scored) < len(results) else ""))
             print(f"Per-episode: {results}")
             print(f"{'='*50}")
 

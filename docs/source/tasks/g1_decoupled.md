@@ -13,11 +13,13 @@ python -m simple.cli.teleop_decoupled_wbc simple/G1WholebodyOpenTrashCanTeleop-v
   --sim-mode=mujoco --record --no-headless
 ```
 
-## Environments (12)
+## Environments (14)
 
 Alongside pick, place and handover, this set covers the **articulated-object**
 and **non-prehensile** skills that motion planning cannot synthesize — opening a
-trash can, oven or faucet, closing a door, and pushing an office chair.
+trash can, oven or faucet, closing a door, and pushing an office chair. Two are
+**bimanual**: picking up a bottle with one hand and pulling its cap off with the other, with a 17 cm or a 12 cm
+bottle.
 
 * `simple/G1WholebodyBendHandoverTeleop-v0`
 * `simple/G1WholebodyBendPickAndPlaceTeleop-v0`
@@ -30,4 +32,6 @@ trash can, oven or faucet, closing a door, and pushing an office chair.
 * `simple/G1WholebodyOpenTrashCanTeleop-v0`
 * `simple/G1WholebodyPickAndPlaceAndHugContainerTeleop-v0`
 * `simple/G1WholebodyPushOfficeChairTeleop-v0`
+* `simple/G1WholebodyUncapBottleTeleop-v0`
+* `simple/G1WholebodyUncapSmallBottleTeleop-v0`
 * `simple/G1WholebodyXMovePickTeleop-v0`

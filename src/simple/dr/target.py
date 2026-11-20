@@ -11,6 +11,10 @@ from typing import Type, Dict, Any
 # if TYPE_CHECKING:
 #     from simple.dr.target import TargetDr
 
+# Inner state for a scene recorded without a target object (`"target": null`).
+# Kept in `_inner_state` so the DRManager's per-episode reset clears it.
+_NO_TARGET = object()
+
 class TargetDR(Randomizer):
 
     # asset_id: str
@@ -20,14 +24,19 @@ class TargetDR(Randomizer):
         super().__init__(cfg)
         self.res_id, self.obj_id = cfg.asset_id.split(':')
     
-    def state_dict(self) -> Dict[str, Any]:
+    def state_dict(self) -> Dict[str, Any] | None:
         # state_dict = {}
         # for k, v in self._inner_state.items():
         #     state_dict[k] = v.to_dict()
         # return state_dict
+        if self._inner_state is _NO_TARGET:
+            return None
         return self._inner_state.to_dict() if self._inner_state else {}
     
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+    def load_state_dict(self, state_dict: Dict[str, Any] | None) -> None:
+        if state_dict is None:
+            self._inner_state = _NO_TARGET
+            return
         # Older recordings (generic Entity.to_dict, e.g. primitive Cube targets)
         # carry no res_id — fall back to this randomizer's configured asset.
         res_id = state_dict.get("res_id", self.res_id)
@@ -39,7 +48,9 @@ class TargetDR(Randomizer):
             load_kwargs["size"] = state_dict["size"]
         self._inner_state = AssetManager.get(res_id).load(uid, **load_kwargs)
 
-    def __call__(self, split: str, **kwargs) -> Asset:
+    def __call__(self, split: str, **kwargs) -> Asset | None:
+        if self._inner_state is _NO_TARGET:
+            return None
         
         # res_id, obj_id = self.asset_id.split(':')
         # Primitive targets (e.g. "primitive:cube") take a caller-provided size;

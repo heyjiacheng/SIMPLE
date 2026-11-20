@@ -99,6 +99,15 @@ def _save_episode_env_config(exporter, env_config: dict, episode_index: int):
             f.write(json.dumps(entry) + "\n")
 
 
+def _keep_robot_position(env_conf: dict, robot_key: str) -> dict:
+    """`env_conf` with only the robot's placement left in its spatial state: the reset places the objects anew."""
+    spatial = (env_conf.get("dr_state_dict") or {}).get("spatial")
+    if not spatial:
+        return env_conf
+    kept = {k: v for k, v in spatial.items() if k == robot_key}
+    return {**env_conf, "dr_state_dict": {**env_conf["dr_state_dict"], "spatial": kept or None}}
+
+
 def main(
     env_id: Annotated[str, typer.Argument()] = "simple/G1WholebodyXMovePick-v0",
     data_dir: Annotated[str, typer.Option()] = "data/replay_decoupled_wbc/simple/G1WholebodyXMovePick-v0/level-0",
@@ -109,8 +118,20 @@ def main(
     max_episode_steps: Annotated[int | None, typer.Option()] = None,
     success_criteria: Annotated[float | None, typer.Option()] = None,
     save_dir: Annotated[str, typer.Option()] = "data/evals",
+    spatial_level: Annotated[
+        int,
+        typer.Option(
+            help="1: place the task's objects anew, spread further to either side, as teleop_decoupled_wbc "
+            "--spatial-level 1 does, at any --dr-level; each episode keeps its robot position. Saves to "
+            "<save-dir>/<env-id>/dr-level-<n>-spatial-1, next to the set without it. 0: as before."
+        ),
+    ] = 0,
 ):
     """Create minimal evaluation dataset with first frame and environment_config."""
+    from simple.core.task import Task
+
+    if spatial_level not in Task.SPATIAL_LEVELS:
+        raise typer.BadParameter(f"--spatial-level {spatial_level}: expected one of {list(Task.SPATIAL_LEVELS)}")
     sonic_config = _make_sonic_config()
     print(f"Creating environment: {env_id}")
     env = gym.make(
@@ -134,6 +155,9 @@ def main(
         task.metadata["success_criteria"] = success_criteria
 
     print(f"DR level: {dr_level}")
+    if spatial_level:
+        task.set_spatial_level(spatial_level)
+        print(f"Spatial level: {spatial_level} (the task's objects placed anew, further to either side)")
 
     agent = PicoDecoupledAgent(task.robot)  # type: ignore
     agent.num_episodes = num_episodes
@@ -155,6 +179,8 @@ def main(
     episodes_saved = 0
     obj_names = []
     run_save_dir = f"{os.path.abspath(save_dir)}/{sonic_env.spec.id}/dr-level-{dr_level}"
+    if spatial_level:
+        run_save_dir += f"-spatial-{spatial_level}"
     run_save_path = Path(run_save_dir)
 
     # Clean up existing dataset
@@ -170,6 +196,8 @@ def main(
 
             # Reset environment with the exact scene configuration
             env_conf = episode_configs[ep_idx]
+            if spatial_level:
+                env_conf = _keep_robot_position(env_conf, str(robot.uid))
             observation, privileged_info = env.reset(options={"state_dict": env_conf, "dr_level": dr_level})
 
             # Initialize exporter on first episode

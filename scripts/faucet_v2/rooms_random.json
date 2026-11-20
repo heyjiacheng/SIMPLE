@@ -1,0 +1,11 @@
+{
+  "scene1": ["box", "big", "small"],
+  "scene3": ["box", "big", "small"],
+  "scene6": ["box", "small"],
+  "scene7": ["box", "small"],
+  "scene9": ["box", "big", "small"],
+  "scene12": ["box", "small"],
+  "scene14": ["box", "small"],
+  "scene15": ["box", "small"],
+  "scene25": ["box", "big", "small"]
+}

@@ -45,6 +45,7 @@ class MujocoSimulator(Simulator):
         self.robot_mjcf = None
         self.render_option = None
         self.renderers = {}
+        self.skip_cameras: set[str] = set()  # cameras render() leaves out (and out of its result), e.g. unused teleop views
         self.default_camera_name = None
         self.render_step = 0
         self.last_action = [0 for _ in range(17)]#TODO
@@ -508,8 +509,34 @@ class MujocoSimulator(Simulator):
         self.robot_mjcf = robot_mjcf
 
     def _build_primitive(self, mjSpec, mjWorld, actor: Primitive, table_name: str = 'table'):
-        from simple.assets.primitive import Box
-        if isinstance(actor, Box):
+        from simple.assets.primitive import Box, Cylinder, Prism
+        if isinstance(actor, Prism):
+            # polygonal table top: MuJoCo collides with a mesh's convex hull, which
+            # is exact for the (convex) prism; same contact parameters as the box
+            half = 0.5 * actor.size[2]
+            mjSpec.add_mesh(name=f"{table_name}_mesh",
+                            uservert=[c for z in (-half, half) for x, y in actor.vertices for c in (x, y, z)])
+            table = mjWorld.add_body(name=table_name,
+                                     pos=actor.pose.position,
+                                     quat=actor.pose.quaternion)
+            table.add_geom(name=f"{table_name}_geom",
+                           type=mujoco.mjtGeom.mjGEOM_MESH,
+                           meshname=f"{table_name}_mesh",
+                           condim=6,
+                           friction=[2, 0.04, 0.0005],
+                           priority=10,)
+        elif isinstance(actor, Cylinder):
+            # round table top: same contact parameters as the box table below
+            table = mjWorld.add_body(name=table_name,
+                                     pos=actor.pose.position,
+                                     quat=actor.pose.quaternion)
+            table.add_geom(name=f"{table_name}_geom",
+                           type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+                           size=[actor.radius, 0.5 * actor.size[2], 0],
+                           condim=6,
+                           friction=[2, 0.04, 0.0005],
+                           priority=10,)
+        elif isinstance(actor, Box):
             table_size = 0.5 * np.array(actor.size)
             table_position = actor.pose.position.copy()
             default_table_z = -0.5 * actor.size[2]
@@ -749,7 +776,7 @@ class MujocoSimulator(Simulator):
         robot_geom_ids = self._robot_mask_geom_ids() if mask_camera_name is not None else set()
         for mjCamera in self.mj_worldbody.find_all('camera'):
             renderer = self.renderers[mjCamera.name]
-            if renderer is None:
+            if renderer is None or mjCamera.name in self.skip_cameras:
                 continue
             
             # with self._telemetry.timer(f"render.updatescene.{mjCamera.name}"):

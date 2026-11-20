@@ -1,16 +1,70 @@
 # Copyright (c) 2025-2026 The SIMPLE Authors
 # SPDX-License-Identifier: MIT
 
+import os
+import subprocess
 import time
 import cv2
 import numpy as np
 
 from simple.core.action import ActionCmd
 from simple.robots.g1_sonic import G1Sonic
+from simple.teleop.pico.hand_modes import HAND_MODES, make_hand_ik_solvers
 from simple.teleop.pico.tcp_server import TCPControlServer
 from simple.teleop.pico.tcp_video_sender import TCPVideoSender
 from simple.teleop.pico.streaming import FrameBuffer, StreamingThread
 from .sonic_wbc_agent import SonicWbcAgent
+
+# What the headset shows (teleop_decoupled_wbc --vr-view):
+#   head: the head camera's stereo pair.
+#   vla:  the head camera's left eye, the image the datasets record, as the policy sees it after its image transform
+#         (policy_view), in both eyes.
+#   side: the stereo pair of one of the task's side_view_cfgs cameras; A swaps between the left and the right one.
+VR_VIEWS = ("head", "vla", "side")
+SIDES = ("left", "right")
+
+# Psi-0's image transform (Psi0 finetune-simple-psi0.sh: --data.transform.model.resize.size 180 320,
+# --data.transform.model.center_crop.size 180 320), (height, width).
+PSI0_RESIZE = (180, 320)
+PSI0_CROP = (180, 320)
+
+# --torso-stick: the right joystick leans the torso, so the head camera (fixed to the torso) can look past the hands.
+# The lean follows the joystick's deflection and comes back upright when it is released. Lean, not turn: the camera
+# sits 0.43 m above the waist joints and only 6 cm in front of the yaw axis, so turning the torso pans the view without
+# moving the camera (1.7 cm at 0.3 rad), while leaning moves it. These are posture targets for the teleop IK; the
+# lower-body policy then tracks the torso pitch fully but the roll only about half. Measured at full deflection, arms
+# forward (MuJoCo, 2026-11-11): sideways the torso rolls 0.19 rad and the camera moves 7 cm; forward it pitches 0.38 rad
+# and the camera moves 10 cm forward and 4 cm down; back, 4 cm. The robot keeps its balance (pelvis within 2 cm), but
+# the hands drift 4-8 cm while it leans, as the arms are bent for the lean the IK asked for.
+TORSO_LEAN_MAX = {"right": 0.5, "forward": 0.5, "back": 0.25}  # rad at full deflection: waist roll, waist pitch
+TORSO_LEAN_RATE = 1.0  # rad/s: how fast the lean follows the joystick
+STICK_DEAD_ZONE = 0.1  # as PicoStreamer's
+
+# --keep-failures: Left Menu + both index triggers ends the episode as a failure. PicoStreamer already reads Left Menu +
+# one index trigger (+ right: teleop on/off, + left: the lower-body policy on/off), so such a press waits this long for
+# the other trigger before the streamer gets it.
+FAILURE_COMBO_WINDOW = 0.25  # s
+
+
+def policy_view(image: np.ndarray, resize: tuple[int, int] = PSI0_RESIZE, crop: tuple[int, int] = PSI0_CROP) -> np.ndarray:
+    """`image` (H x W x 3, uint8) as a policy that resizes it, then center-crops it, sees it. Both sizes are
+    (height, width). This is Psi-0's model transform: torchvision v2.Resize(resize, NEAREST), then v2.CenterCrop(crop),
+    on a PIL image, which resizes with PIL."""
+    from PIL import Image
+
+    img = Image.fromarray(image).resize((resize[1], resize[0]), Image.Resampling.NEAREST)
+    (h, w), (ch, cw) = resize, crop
+    if ch > h or cw > w:
+        raise ValueError(f"crop {crop} is larger than the resized image {resize}")
+    top, left = int(round((h - ch) / 2.0)), int(round((w - cw) / 2.0))  # as torchvision's center_crop
+    return np.asarray(img)[top : top + ch, left : left + cw]
+
+
+def _dead_zone(value: float, dead_zone: float = STICK_DEAD_ZONE) -> float:
+    """PicoStreamer's dead zone: 0 inside it, rescaled to reach +-1 at full deflection outside."""
+    if abs(value) < dead_zone:
+        return 0.0
+    return float(np.sign(value)) * (abs(value) - dead_zone) / (1.0 - dead_zone)
 
 
 class PicoDecoupledAgent(SonicWbcAgent):
@@ -25,10 +79,45 @@ class PicoDecoupledAgent(SonicWbcAgent):
     are derived from the Pico controller buttons read by the same streamer.
     """
 
-    def __init__(self, robot: G1Sonic):
+    def __init__(
+        self,
+        robot: G1Sonic,
+        hand_mode: str = "split",
+        vr_view: str = "head",
+        torso_stick: bool = False,
+        vla_resize: tuple[int, int] = PSI0_RESIZE,
+        vla_crop: tuple[int, int] = PSI0_CROP,
+        keep_failures: bool = False,
+    ):
+        """`hand_mode`: how the triggers close the hands, one of HAND_MODES (see simple.teleop.pico.hand_modes).
+        `vr_view`: what the headset shows, one of VR_VIEWS; `vla_resize` and `vla_crop` are the policy's image transform
+        for the "vla" view (see policy_view). `torso_stick`: the right joystick leans the torso instead of turning the
+        robot. `keep_failures`: Left Menu + both index triggers sets failure_requested (see _init_failure_combo), and
+        the headset counts the failed episodes (episodes_failed) too."""
+        if hand_mode not in HAND_MODES:
+            raise ValueError(f"unknown hand mode {hand_mode!r}, expected one of {HAND_MODES}")
+        if vr_view not in VR_VIEWS:
+            raise ValueError(f"unknown VR view {vr_view!r}, expected one of {VR_VIEWS}")
         super().__init__(robot)
 
+        self.vr_view = vr_view
+        self.side = SIDES[0]  # the side camera the "side" view shows
+        self.vla_resize, self.vla_crop = tuple(vla_resize), tuple(vla_crop)
+        self.torso_stick = torso_stick
+        self._torso_lean = np.zeros(2)  # rad: waist roll (+ leans right), waist pitch (+ leans forward)
+        self._right_stick = np.zeros(2)
+        self._side_btn_last = False
+
+        self.hand_mode = hand_mode
+        if hand_mode == "split":
+            print("[PicoDecoupled] Hand mode split: index trigger = thumb + index, middle trigger = thumb + middle, "
+                  "both = full grasp. Reset: left menu + both middle triggers.")
+        else:
+            print("[PicoDecoupled] Hand mode binary: a trigger closes the whole hand. Reset: both middle triggers.")
+
         self.episodes_saved = 0
+        self.episodes_failed = 0  # --keep-failures: the failed episodes saved, shown after episodes_saved
+        self.keep_failures = keep_failures
         self.num_episodes = 100
         self.image_publish_process = None
         self.sim_dt = self.robot.sonic_config["SIMULATE_DT"]
@@ -47,6 +136,11 @@ class PicoDecoupledAgent(SonicWbcAgent):
 
         # --- Decoupled WBC pipeline ---
         self._init_decoupled_policy()
+        if torso_stick:
+            self._init_torso_stick()
+        self._failure_requested = False
+        if keep_failures:
+            self._init_failure_combo()
 
     @property
     def reset_requested(self) -> bool:
@@ -56,6 +150,12 @@ class PicoDecoupledAgent(SonicWbcAgent):
             return True
         return False
 
+    @property
+    def failure_requested(self) -> bool:
+        """--keep-failures: True if Left Menu + both index triggers were pressed since the last read. Clears on read."""
+        requested, self._failure_requested = self._failure_requested, False
+        return requested
+
     # ------------------------------------------------------------------
     # Initialization helpers
     # ------------------------------------------------------------------
@@ -64,8 +164,34 @@ class PicoDecoupledAgent(SonicWbcAgent):
         """Set up TCP server for VR camera streaming."""
         self._streaming: StreamingThread | None = None
         self._frame_buffer = FrameBuffer()
+        self._stream_size: tuple[int, int] | None = None  # (width, height) of the stream's frames, both eyes
 
         tcp_server = TCPControlServer("0.0.0.0:13579")
+
+        # PICO_ADB=1: run all headset<->PC traffic through the USB cable via adb
+        # instead of Wi-Fi. In XRoboToolkit, enter 127.0.0.1 as the PC IP.
+        #   13579: headset -> this script (camera control)
+        #   63901: headset -> XRoboToolkit PC service (tracking/controllers)
+        use_adb = os.environ.get("PICO_ADB", "0") not in ("", "0")
+        if use_adb:
+            # If the XRoboToolkit app is already running on the headset it binds
+            # 13579 itself and `adb reverse` fails with "Address already in use".
+            # In that case stop the app, retry, and relaunch it afterwards.
+            app = "com.xrobotoolkit.client"
+            restarted = False
+            for p in (13579, 63901):
+                cmd = ["adb", "reverse", f"tcp:{p}", f"tcp:{p}"]
+                if subprocess.run(cmd).returncode != 0:
+                    print(f"[PicoDecoupled] PICO_ADB: port {p} busy on headset; restarting {app}")
+                    subprocess.run(["adb", "shell", "am", "force-stop", app], check=True)
+                    restarted = True
+                    subprocess.run(cmd, check=True)
+            if restarted:
+                subprocess.run(
+                    ["adb", "shell", "monkey", "-p", app, "-c", "android.intent.category.LAUNCHER", "1"],
+                    stdout=subprocess.DEVNULL, check=False,
+                )
+            print("[PicoDecoupled] PICO_ADB: tunnelling 13579/63901 over USB; use 127.0.0.1 in XRoboToolkit")
 
         def on_open_camera(camera_req):
             print(f"[PicoDecoupled] OPEN_CAMERA: {camera_req}")
@@ -84,6 +210,11 @@ class PicoDecoupledAgent(SonicWbcAgent):
             if not ip or not port:
                 print("[PicoDecoupled] OPEN_CAMERA missing ip/port, cannot stream")
                 return
+            if use_adb:
+                # The headset's video receiver listens on `port`; reach it through adb.
+                subprocess.run(["adb", "forward", f"tcp:{port}", f"tcp:{port}"], check=True)
+                print(f"[PicoDecoupled] PICO_ADB: video {ip}:{port} -> 127.0.0.1:{port} via adb")
+                ip = "127.0.0.1"
             try:
                 sender = TCPVideoSender(
                     ip=ip, port=port,
@@ -94,6 +225,7 @@ class PicoDecoupledAgent(SonicWbcAgent):
                 print(f"[PicoDecoupled] Connection refused to {ip}:{port}")
                 return
 
+            self._stream_size = (int(width), int(height))
             self._streaming = StreamingThread(
                 frame_buffer=self._frame_buffer,
                 fps=fps,
@@ -117,9 +249,6 @@ class PicoDecoupledAgent(SonicWbcAgent):
         """Initialize the decoupled WBC pipeline (streamer + teleop IK + WBC policy)."""
         from decoupled_wbc.control.robot_model.instantiation.g1 import (
             instantiate_g1_robot_model,
-        )
-        from decoupled_wbc.control.teleop.solver.hand.instantiation.g1_hand_ik_instantiation import (
-            instantiate_g1_hand_ik_solver,
         )
         from decoupled_wbc.control.teleop.teleop_retargeting_ik import TeleopRetargetingIK
         from decoupled_wbc.control.policy.teleop_policy import TeleopPolicy
@@ -159,7 +288,7 @@ class PicoDecoupledAgent(SonicWbcAgent):
         )
 
         # Teleop policy (Pico streamer + retargeting IK)
-        left_hand_ik, right_hand_ik = instantiate_g1_hand_ik_solver()
+        left_hand_ik, right_hand_ik = make_hand_ik_solvers(self.hand_mode)
         retargeting_ik = TeleopRetargetingIK(
             robot_model=self._dwbc_robot_model,
             left_hand_ik_solver=left_hand_ik,
@@ -199,6 +328,97 @@ class PicoDecoupledAgent(SonicWbcAgent):
         self._cached_left_hand_q = None
         self._cached_right_hand_q = None
 
+    def _init_torso_stick(self):
+        """Take the right joystick from PicoStreamer (it turned the robot) and lean the torso with it.
+
+        The lean is the waist roll and pitch target of the teleop IK's posture task. The IK keeps the hands on their
+        targets (relative to the pelvis) and bends the arms to make up for the lean, and the lower-body policy tracks
+        the torso orientation that results, as it does for the waist the IK already uses to reach. With the joystick
+        released the target is 0, the posture target the IK has always had, so teleop is unchanged.
+        """
+        ik = self._teleop_policy.retargeting_ik
+        index = ik.body.joint_to_dof_index
+        names = self._dwbc_robot_model.supplemental_info.joint_name_mapping
+        try:
+            self._waist_ik_index = [index[names["waist_roll"]], index[names["waist_pitch"]]]
+        except KeyError as e:
+            raise ValueError("--torso-stick needs the waist in the teleop IK (sonic config enable_waist: true)") from e
+
+        streamer = self._pico_streamer
+        read = streamer._get_pico_data
+
+        def get_pico_data():
+            data = read()
+            self._right_stick = np.asarray(data["right_joystick"], dtype=float)
+            data["right_joystick"] = [0.0, 0.0]  # the robot doesn't turn: the joystick is the torso's
+            self._update_torso_lean()  # before this step's IK solve, which follows in TeleopPolicy.get_action()
+            return data
+
+        # PicoStreamer.get() reads the controllers through it, once a step (and once more when teleop is activated)
+        streamer._get_pico_data = get_pico_data
+
+    def _update_torso_lean(self):
+        """Move the lean toward the right joystick's deflection, at most TORSO_LEAN_RATE, and give it to the IK."""
+        x, y = (_dead_zone(float(v)) for v in self._right_stick[:2])  # x: right, y: forward, as PicoStreamer reads them
+        target = np.array([x * TORSO_LEAN_MAX["right"], y * TORSO_LEAN_MAX["forward" if y > 0 else "back"]])
+        step = TORSO_LEAN_RATE * self._control_dt
+        self._torso_lean += np.clip(target - self._torso_lean, -step, step)
+        posture = self._teleop_policy.retargeting_ik.body_ik_solver.tasks["posture"]  # remade by each IK reset
+        q = np.array(posture.target_q, dtype=float)
+        q[self._waist_ik_index] = self._torso_lean
+        posture.set_target(q)
+
+    def _init_failure_combo(self):
+        """--keep-failures: Left Menu + both index triggers sets failure_requested.
+
+        PicoStreamer turns Left Menu + one index trigger into a toggle, on the press: + right turns teleop on or off,
+        + left the lower-body policy. Two triggers are never pressed in the same instant, so the first of them would
+        toggle one of these before the combo is complete. Hence the controllers are read through this filter, which holds
+        a Left Menu + index trigger press back from the streamer for FAILURE_COMBO_WINDOW. If the other trigger joins in
+        that time, it is the combo, and the streamer never sees the press. Otherwise the streamer gets it when the window
+        ends, or, if it is let go sooner, once, at that moment: each toggle still works, at most that much later. After
+        the combo the triggers stay hidden until they or the menu button are let go, so the press can't start the next
+        episode. The menu button opens the hands while it is held, as before; the filter doesn't change that.
+        """
+        streamer = self._pico_streamer
+        read = streamer._get_pico_data  # PicoStreamer's own, or --torso-stick's filter
+        self._combo_latched = False  # after the combo, until let go
+        self._combo_pending = None  # (time, "left" or "right"): a Left Menu + index trigger press held back
+
+        def hide_triggers(data):
+            data["left_trigger"] = data["right_trigger"] = 0.0
+            return data
+
+        def get_pico_data():
+            data = read()
+            menu = bool(data["left_menu_button"])
+            left, right = data["left_trigger"] > 0.5, data["right_trigger"] > 0.5
+            held = menu and (left or right)
+            now = time.monotonic()
+            if self._combo_latched and held:
+                return hide_triggers(data)
+            self._combo_latched = False
+            if menu and left and right:
+                self._failure_requested = True
+                self._combo_latched = True
+                self._combo_pending = None
+                print("[PicoDecoupled] Failure combo (L-menu + L-trigger + R-trigger)")
+                return hide_triggers(data)
+            if held:
+                if self._combo_pending is None:
+                    self._combo_pending = (now, "left" if left else "right")
+                if now - self._combo_pending[0] < FAILURE_COMBO_WINDOW:
+                    return hide_triggers(data)
+                return data  # held past the window: the streamer sees the press now
+            pending, self._combo_pending = self._combo_pending, None
+            if pending is not None and now - pending[0] < FAILURE_COMBO_WINDOW:
+                data["left_menu_button"] = True  # let go within the window: the streamer gets the press, once
+                data[f"{pending[1]}_trigger"] = 1.0
+            return data
+
+        streamer._get_pico_data = get_pico_data
+        print("[PicoDecoupled] --keep-failures: left menu + both index triggers ends the episode as a failure.")
+
     # ------------------------------------------------------------------
     # Button helpers (read directly from PicoStreamer's XrClient)
     # ------------------------------------------------------------------
@@ -208,7 +428,8 @@ class PicoDecoupledAgent(SonicWbcAgent):
 
         Matches the pico_manager conventions:
           - right_axis_click          -> drop_robot
-          - left_grip + right_grip    -> reset_env
+          - left_grip + right_grip    -> reset_env (hand mode "split": also hold left_menu_button, since the grips
+                                         close fingers there; holding the menu button opens both hands)
         """
         xr = self._pico_streamer.xr_client
 
@@ -228,10 +449,40 @@ class PicoDecoupledAgent(SonicWbcAgent):
         left_grip = xr.get_key_value_by_name("left_grip") > 0.5
         right_grip = xr.get_key_value_by_name("right_grip") > 0.5
         reset_btn = left_grip and right_grip
+        if self.hand_mode == "split":
+            reset_btn = reset_btn and bool(xr.get_button_state_by_name("left_menu_button"))
         if reset_btn and not self._reset_btn_last:
             self._reset_requested = True
-            print("[PicoDecoupled] Environment reset requested (L-grip + R-grip)")
+            combo = "L-menu + L-grip + R-grip" if self.hand_mode == "split" else "L-grip + R-grip"
+            print(f"[PicoDecoupled] Environment reset requested ({combo})")
         self._reset_btn_last = reset_btn
+
+    def _poll_side_button(self):
+        """In the "side" view, A (right controller) swaps the left and right side cameras (edge-triggered). Read every
+        step of that view, also while the robot settles. (B is taken: XRoboToolkit's stereo/mono view toggle.)"""
+        side_btn = bool(self._pico_streamer.xr_client.get_button_state_by_name("A"))
+        if side_btn and not self._side_btn_last:
+            self.side = SIDES[1 - SIDES.index(self.side)]
+            print(f"[PicoDecoupled] Side view: {self.side} camera (A)")
+        self._side_btn_last = side_btn
+
+    def set_vr_view(self, vr_view: str):
+        if vr_view not in VR_VIEWS:
+            raise ValueError(f"unknown VR view {vr_view!r}, expected one of {VR_VIEWS}")
+        self.vr_view = vr_view
+
+    @property
+    def vr_cameras(self) -> set[str]:
+        """The cameras the headset view needs this step."""
+        if self.vr_view == "vla":
+            return {"head_stereo_left"}
+        if self.vr_view == "side":
+            return {f"side_{self.side}_left", f"side_{self.side}_right"}
+        return {"head_stereo_left", "head_stereo_right"}
+
+    @property
+    def vr_view_label(self) -> str:
+        return f"SIDE {self.side[0].upper()}" if self.vr_view == "side" else self.vr_view.upper()
 
     # ------------------------------------------------------------------
     # Rendering / streaming
@@ -241,25 +492,60 @@ class PicoDecoupledAgent(SonicWbcAgent):
         if self.image_publish_process is not None:
             self.image_publish_process.update_shared_memory(observation)
         if self._streaming and self._streaming.is_running():
-            self._push_stereo_frame(observation)
+            self._push_vr_frame(observation)
         return observation
 
-    def _push_stereo_frame(self, observation: dict) -> None:
-        left = observation.get("head_stereo_left")
-        right = observation.get("head_stereo_right")
+    def _vr_eyes(self, observation: dict) -> tuple[np.ndarray, np.ndarray] | None:
+        """The left and right eye images (BGR) of the current view, or None if this step didn't render them."""
+        if self.vr_view == "vla":
+            image = observation.get("head_stereo_left")
+            if image is None:
+                return None
+            seen = policy_view(image, self.vla_resize, self.vla_crop)[..., ::-1]
+            # Scale up to the stream's own eye size here, nearest-neighbour, so each of the policy's pixels shows as a
+            # sharp block instead of being smoothed by the encoder's scaler. Both eyes get it: the policy is monocular.
+            width, height = self._stream_size or (2 * image.shape[1], image.shape[0])
+            eye = cv2.resize(seen, (width // 2, height), interpolation=cv2.INTER_NEAREST)
+            return eye, eye.copy()
+        left, right = (observation.get(name) for name in sorted(self.vr_cameras))  # "..._left" < "..._right"
         if left is None or right is None:
+            return None
+        return np.ascontiguousarray(left[..., ::-1]), np.ascontiguousarray(right[..., ::-1])
+
+    def _push_vr_frame(self, observation: dict) -> None:
+        eyes = self._vr_eyes(observation)
+        if eyes is None:
             return
-        left_bgr = np.ascontiguousarray(left[..., ::-1])
-        right_bgr = np.ascontiguousarray(right[..., ::-1])
-        # Draw debug text on top-right of each eye
-        text = f"{self.episodes_saved}/{self.num_episodes}"
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        scale, thickness = 1.0, 2
-        (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
-        x = left_bgr.shape[1] - tw - 100
-        y = th + 10
-        cv2.putText(left_bgr, text, (x, y), font, scale, (0, 255, 0), thickness)
-        cv2.putText(right_bgr, text, (x, y), font, scale, (0, 255, 0), thickness)
+        left_bgr, right_bgr = eyes
+        # While teleop is off (start, or after a reset or a saved episode) the scene is still, which looks like a
+        # frozen stream: say what the robot is waiting for. `_stabilized` is read directly, because the
+        # `stabilized` property counts its reads.
+        status = None
+        if not self._teleop_policy.is_active:
+            status = "PRESS MENU + R-TRIGGER" if self.robot._stabilized else "SETTLING..."
+        # The "vla" view shows exactly what the policy gets while teleop runs: no text on it then.
+        if self.vr_view != "vla" or status is not None:
+            # Top right of each eye: the episodes saved, after the view's name in a view other than head (the head view
+            # keeps its original text)
+            text = f"{self.episodes_saved}/{self.num_episodes}"
+            if self.keep_failures:
+                text += f", {self.episodes_failed} failed"
+            if self.vr_view != "head":
+                text = f"{self.vr_view_label} {text}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            # the original size; the "vla" view's eyes are scaled up to the stream's size, and its text with them
+            scale = left_bgr.shape[1] / 640 if self.vr_view == "vla" else 1.0
+            thickness = max(1, round(2 * scale))
+            (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+            x = left_bgr.shape[1] - tw - round(100 * scale)
+            y = th + round(10 * scale)
+            cv2.putText(left_bgr, text, (x, y), font, scale, (0, 255, 0), thickness)
+            cv2.putText(right_bgr, text, (x, y), font, scale, (0, 255, 0), thickness)
+            if status is not None:
+                (sw, sh), _ = cv2.getTextSize(status, font, scale, thickness)
+                sx, sy = (left_bgr.shape[1] - sw) // 2, y + sh + round(20 * scale)
+                cv2.putText(left_bgr, status, (sx, sy), font, scale, (0, 255, 255), thickness)
+                cv2.putText(right_bgr, status, (sx, sy), font, scale, (0, 255, 255), thickness)
         stereo = np.concatenate([left_bgr, right_bgr], axis=1)
         self._frame_buffer.put(stereo)
 
@@ -463,6 +749,8 @@ class PicoDecoupledAgent(SonicWbcAgent):
         # proprio = self.robot.prepare_obs()
         # for k,v in kwargs["privileged_info"]["proprio"].items(): assert np.all(v == proprio[k])
         proprio = kwargs["privileged_info"]["proprio"]
+        if self.vr_view == "side":
+            self._poll_side_button()
         if not self.robot.stabilized:
             return self.get_stabilize_action(proprio)
         
@@ -542,6 +830,7 @@ class PicoDecoupledAgent(SonicWbcAgent):
         self._teleop_was_active = False
         self._teleop_activate_time = None
         self._last_teleop_action = {}
+        self._torso_lean[:] = 0.0  # upright; the IK's posture target was just remade at 0 too
 
     def publish_low_state(self, proprio):
         # No Unitree bridge needed — decoupled WBC reads from SIMPLE directly

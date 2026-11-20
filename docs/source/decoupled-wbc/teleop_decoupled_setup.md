@@ -198,12 +198,20 @@ Once the environment is running and the visual stream is active, use the followi
 | **Start Teleoperation** | `Left Menu` + `Right index Trigger` | **Left Menu:** Button with three lines.<br>**Right index Trigger:** Right index finger. |
 | **Locomotion (X/Y)** | `Left Joystick` | Move the robot base (Forward/Backward/Sidestep). |
 | **Rotation (Yaw)** | `Right Joystick` | Rotate the robot base (Turn Left/Right). |
-| **Left Hand** | `Left index Trigger` | **Left index finger:** Controls opening/closing of the left hand. |
-| **Right Hand** | `Right index Trigger` | **Right index finger:** Controls opening/closing of the right hand. |
+| **Pinch (thumb + index)** | `Index Trigger` | Closes that hand's thumb and index finger; the middle finger stays open. |
+| **Pinch (thumb + middle)** | `Middle Trigger` | Closes that hand's thumb and middle finger; the index finger stays open. |
+| **Full Grasp** | `Index Trigger` + `Middle Trigger` | Closes all three fingers of that hand. |
 | **Squat / Crouch** | `X Button` | **Left Controller:** Robot performs a squatting motion. |
 | **Stand Up** | `Y Button` | **Right Controller:** Robot returns to a standing posture. |
-| **Manual Reset** | `Left Middle Trigger` + `Right Middle Trigger` | **Middle Fingers:** Press both side buttons  to force-reset episode. |
+| **Manual Reset** | `Left Menu` + `Left Middle Trigger` + `Right Middle Trigger` | Hold the menu button and press both side buttons to force-reset the episode. Holding the menu button opens both hands. With `--keep-failures`, the episode is saved as failed instead of thrown away. |
+| **Save as Failed** | `Left Menu` + `Left index Trigger` + `Right index Trigger` | With `--keep-failures`: end the episode and save it, listed as failed in `meta/failed_episodes.json`. |
 | **Toggle View** | `B Button` | **Right Controller:** Toggle between Stereo and Single camera views. |
+| **Lean Torso** | `Right Joystick` | With `--torso-stick`: lean the torso left/right and forward/back, so the head camera sees past the hands. It returns upright when released. The joystick no longer turns the robot. |
+| **Swap Side Camera** | `A Button` | **Right Controller**, with `--vr-view side`: switch between the left and the right side camera. |
+
+The hand and reset rows above are the default `--hand-mode=split`. With `--hand-mode=binary` (the original mode),
+either trigger closes the whole hand, and the reset is `Left Middle Trigger` + `Right Middle Trigger`.
+See [Teleoperation](teleoperation.md) for `--vr-view`, `--torso-stick` and `--keep-failures`.
 
 ---
 
@@ -213,4 +221,5 @@ Once the environment is running and the visual stream is active, use the followi
 2.  **Engage Control:** Hold `Left Menu` and `Right indexTrigger` simultaneously. Your physical posture will now sync to the robot.
 3.  **Execution & Saving:**
     * **Auto-Save:** If the system judges the task as **Successful**, it will automatically save the trajectory and refresh the episode.
-    * **Manual Reset:** If you wish to restart or if the task fails, press **both Side middle trigger** (middle fingers) simultaneously to reset the episode manually.
+    * **Manual Reset:** If you wish to restart or if the task fails, hold `Left Menu` and press **both side middle triggers** (middle fingers) to reset the episode manually. With `--hand-mode=binary`, the two middle triggers alone reset it.
+    * **Keeping Failures:** With `--keep-failures`, a failed try is saved too: hold `Left Menu` and press **both index triggers**, or reset as above. The episode is listed as failed in the dataset's `meta/failed_episodes.json`, so a training set can leave it out.
